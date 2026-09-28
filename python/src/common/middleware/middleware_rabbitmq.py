@@ -10,7 +10,7 @@ from .middleware import (
     MessageMiddlewareQueue,
 )
 
-EXCHANGE_TYPE = "topic"
+EXCHANGE_TYPE = "direct"
 
 
 def _rabbitmq_call(function, *args, error=MessageMiddlewareMessageError, **kwargs):
@@ -85,6 +85,12 @@ class _MessageMiddlewareRabbitMQ(MessageMiddleware):
             _rabbitmq_call(self._channel.basic_cancel, self.consumer_tag)
             self.consumer_tag = None
             _rabbitmq_call(self._channel.stop_consuming)
+
+    def request_stop(self):
+        """Igual que `stop_consuming`, pero seguro de invocar desde un hilo
+        distinto al que está corriendo `start_consuming`."""
+        if self._connection.is_open:
+            self._connection.add_callback_threadsafe(self.stop_consuming)
 
     def close(self):
         """Cierra el canal y la conexión de RabbitMQ si siguen abiertos."""

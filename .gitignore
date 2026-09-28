@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Salida generada por `make test` / `make up`
+python/output/
+golang/output/
+
+# Editores / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
