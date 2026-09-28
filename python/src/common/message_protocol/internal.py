@@ -5,6 +5,7 @@ class MsgType:
     DATA = "DATA"
     EOF = "EOF"
     SUM_BARRIER = "SUM_BARRIER"
+    SUM_PROGRESS = "SUM_PROGRESS"
     AGG_BARRIER = "AGG_BARRIER"
     PARTIAL = "PARTIAL"
     RESULT = "RESULT"
@@ -20,20 +21,36 @@ def build_data(client_id, fruit, amount):
     }
 
 
-def build_eof(client_id):
-    """Fin de flujo de datos de un cliente."""
-    return {"type": MsgType.EOF, "client_id": client_id}
+def build_eof(client_id, total_count):
+    """Fin de datos del cliente, indicando la cantidad total
+    de mensajes DATA enviados."""
+    return {"type": MsgType.EOF, "client_id": client_id, "total_count": total_count}
 
 
-def build_sum_barrier(client_id):
-    """Aviso de una instancia de Aggregation a todas las de Sum de que ya flusheó
-    (o no tenía nada que flushear) los datos de este cliente."""
-    return {"type": MsgType.SUM_BARRIER, "client_id": client_id}
+def build_sum_barrier(client_id, total_count):
+    """Notificación broadcast entre nodos Sum para sincronizar
+    el total de mensajes a procesar."""
+    return {
+        "type": MsgType.SUM_BARRIER,
+        "client_id": client_id,
+        "total_count": total_count,
+    }
+
+
+def build_sum_progress(client_id, sum_id, count):
+    """Progreso parcial de mensajes DATA procesados por un
+    nodo Sum específico."""
+    return {
+        "type": MsgType.SUM_PROGRESS,
+        "client_id": client_id,
+        "sum_id": sum_id,
+        "count": count,
+    }
 
 
 def build_agg_barrier(client_id, sum_id):
-    """Aviso de una instancia de Sum a todas las de Aggregation de que ya flusheó
-    (o no tenía nada que flushear) los datos de este cliente."""
+    """Aviso de una instancia de Sum a todas las de Aggregation
+    indicando que terminó de enviar los datos del cliente."""
     return {"type": MsgType.AGG_BARRIER, "client_id": client_id, "sum_id": sum_id}
 
 
