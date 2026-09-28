@@ -1,7 +1,6 @@
 import logging
 import os
 import signal
-import threading
 import zlib
 
 from common import fruit_item, message_protocol, middleware
@@ -40,9 +39,11 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
-
         self.control_input = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, [f"{SUM_PREFIX}_ctrl_{ID}"]
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
+            [f"{SUM_PREFIX}_ctrl_{ID}"],
+            channel=self.input_queue.channel,
         )
         self.control_outputs = [
             middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -57,13 +58,11 @@ class SumFilter:
             for i in range(AGGREGATION_AMOUNT)
         ]
 
-        self.lock = threading.Lock()
         self.amount_by_client = {}
         self.local_count = {}
         self.total_count = {}
         self.progress_reports = {}
         self.flushed_clients = set()
-        self.control_thread = threading.Thread(target=self._run_control)
 
     # -- Datos --------------------------------------------------------
 
@@ -74,11 +73,8 @@ class SumFilter:
         ) + fruit_item.FruitItem(fruit, int(amount))
 
         self.local_count[client_id] = self.local_count.get(client_id, 0) + 1
-        known_total = client_id in self.total_count
-
-        if known_total:
-            return self._own_progress_message(client_id)
-        return None
+        if client_id in self.total_count:
+            self._broadcast(self._own_progress_message(client_id))
 
     def _own_progress_message(self, client_id):
         count = self.local_count.get(client_id, 0)
@@ -87,8 +83,6 @@ class SumFilter:
     # -- Barrera de cierre entre réplicas de Sum -----------------------
 
     def _broadcast(self, message):
-        """Publica a todas las réplicas de Sum. Necesita 'self.lock' para
-        evitar concurrencia en Pika."""
         for control_output in self.control_outputs:
             control_output.send(message)
 
@@ -97,20 +91,13 @@ class SumFilter:
             fields = im.deserialize(message)
             client_id = fields["client_id"]
 
-            with self.lock:
-                if fields["type"] == im.MsgType.DATA:
-                    progress_message = self._process_data(
-                        client_id, fields["fruit"], fields["amount"]
-                    )
-                    if progress_message is not None:
-                        self._broadcast(progress_message)
-                else:
-                    logger.info(f"Broadcasting SUM_BARRIER for client {client_id}")
-                    self._broadcast(
-                        im.serialize(
-                            im.build_sum_barrier(client_id, fields["total_count"])
-                        )
-                    )
+            if fields["type"] == im.MsgType.DATA:
+                self._process_data(client_id, fields["fruit"], fields["amount"])
+            else:
+                logger.info(f"Broadcasting SUM_BARRIER for client {client_id}")
+                self._broadcast(
+                    im.serialize(im.build_sum_barrier(client_id, fields["total_count"]))
+                )
             ack()
         except Exception:
             logger.exception("Error processing input message")
@@ -121,18 +108,15 @@ class SumFilter:
             fields = im.deserialize(message)
             client_id = fields["client_id"]
 
-            with self.lock:
-                if fields["type"] == im.MsgType.SUM_BARRIER:
-                    if client_id not in self.total_count:
-                        self.total_count[client_id] = fields["total_count"]
-                    self._broadcast(self._own_progress_message(client_id))
-                else:
-                    reports = self.progress_reports.setdefault(client_id, {})
-                    reports[fields["sum_id"]] = fields["count"]
+            if fields["type"] == im.MsgType.SUM_BARRIER:
+                if client_id not in self.total_count:
+                    self.total_count[client_id] = fields["total_count"]
+                self._broadcast(self._own_progress_message(client_id))
+            else:
+                reports = self.progress_reports.setdefault(client_id, {})
+                reports[fields["sum_id"]] = fields["count"]
 
-                should_flush = self._is_client_complete(client_id)
-
-            if should_flush:
+            if self._is_client_complete(client_id):
                 self._flush_client(client_id)
             ack()
         except Exception:
@@ -140,8 +124,6 @@ class SumFilter:
             nack()
 
     def _is_client_complete(self, client_id):
-        """Verifica si la suma de los conteos reportados alcanza el total
-        del cliente (con lock)."""
         if client_id in self.flushed_clients:
             return False
         if client_id not in self.total_count:
@@ -154,14 +136,13 @@ class SumFilter:
     # -- Reparto hacia Aggregation --------------------------------------
 
     def _flush_client(self, client_id):
-        with self.lock:
-            if client_id in self.flushed_clients:
-                return
-            self.flushed_clients.add(client_id)
-            client_state = self.amount_by_client.pop(client_id, {})
-            self.local_count.pop(client_id, None)
-            self.total_count.pop(client_id, None)
-            self.progress_reports.pop(client_id, None)
+        if client_id in self.flushed_clients:
+            return
+        self.flushed_clients.add(client_id)
+        client_state = self.amount_by_client.pop(client_id, {})
+        self.local_count.pop(client_id, None)
+        self.total_count.pop(client_id, None)
+        self.progress_reports.pop(client_id, None)
 
         logger.info(f"Flushing client {client_id} ({len(client_state)} fruits)")
         for item in client_state.values():
@@ -174,21 +155,17 @@ class SumFilter:
         for aggregation_output in self.aggregation_outputs:
             aggregation_output.send(barrier_message)
 
-    def _run_control(self):
-        self.control_input.start_consuming(self._on_control_message)
-        self.control_input.close()
-
     def start(self):
-        self.control_thread.start()
-        self.input_queue.start_consuming(self._on_input_message)
+        self.input_queue.register_consumer(self._on_input_message)
+        self.control_input.register_consumer(self._on_control_message)
+        self.input_queue.pump_forever()
 
     def stop(self):
         self.input_queue.stop_consuming()
-        self.control_input.request_stop()
 
     def close(self):
-        self.control_thread.join()
         self.input_queue.close()
+        self.control_input.close()
         for control_output in self.control_outputs:
             control_output.close()
         for aggregation_output in self.aggregation_outputs:

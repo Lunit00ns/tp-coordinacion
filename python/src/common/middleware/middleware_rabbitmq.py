@@ -42,17 +42,29 @@ class _MessageMiddlewareRabbitMQ(MessageMiddleware):
     y de qué cola consumen.
     """
 
-    def __init__(self, host):
+    def __init__(self, host, channel=None):
         self.host = host
         self.consumer_tag = None
 
-        self._connection, self._channel = _rabbitmq_call(self._create_channel, host)
+        if channel is not None:
+            # Reutiliza el canal de otro middleware ya creado, para que
+            # ambos se puedan consumir desde un único `pump_forever()`
+            # en un solo hilo.
+            self._connection = None
+            self._channel = channel
+        else:
+            self._connection, self._channel = _rabbitmq_call(self._create_channel, host)
         try:
             self._setup_topology()
         except Exception:
             # Si la declaración falla, se libera la conexión ya abierta
             self.close()
             raise
+
+    @property
+    def channel(self):
+        """Expone el canal para que otro middleware lo comparta (`channel=`)."""
+        return self._channel
 
     @staticmethod
     def _create_channel(host):
@@ -64,6 +76,15 @@ class _MessageMiddlewareRabbitMQ(MessageMiddleware):
         """Declara la topología propia de cada subclase (cola o exchange)."""
         raise NotImplementedError
 
+    def _register_consumer(self, queue_name, on_message_callback):
+        """Registra el callback de consumo para una cola, sin bloquear."""
+        self.consumer_tag = _rabbitmq_call(
+            self._channel.basic_consume,
+            queue=queue_name,
+            on_message_callback=_create_message_handler(on_message_callback),
+            auto_ack=False,
+        )
+
     def _consume_from(self, queue_name, on_message_callback):
         """Inicia el consumo desde una cola concreta.
 
@@ -71,12 +92,13 @@ class _MessageMiddlewareRabbitMQ(MessageMiddleware):
         función para confirmarlo (ack) y otra para rechazarlo (nack). Así el
         consumidor decide si el mensaje fue procesado correctamente o no.
         """
-        self.consumer_tag = _rabbitmq_call(
-            self._channel.basic_consume,
-            queue=queue_name,
-            on_message_callback=_create_message_handler(on_message_callback),
-            auto_ack=False,
-        )
+        self._register_consumer(queue_name, on_message_callback)
+        self.pump_forever()
+
+    def pump_forever(self):
+        """Bloquea despachando mensajes de todos los consumidores registrados
+        en este canal: los propios y los de cualquier otro middleware que
+        comparta el mismo canal (constructor con `channel=...`)."""
         _rabbitmq_call(self._channel.start_consuming)
 
     def stop_consuming(self):
@@ -88,25 +110,29 @@ class _MessageMiddlewareRabbitMQ(MessageMiddleware):
 
     def request_stop(self):
         """Igual que `stop_consuming`, pero seguro de invocar desde un hilo
-        distinto al que está corriendo `start_consuming`."""
-        if self._connection.is_open:
+        distinto al que está corriendo `start_consuming`/`pump_forever`."""
+        if self._connection is not None and self._connection.is_open:
             self._connection.add_callback_threadsafe(self.stop_consuming)
 
     def close(self):
-        """Cierra el canal y la conexión de RabbitMQ si siguen abiertos."""
+        """Cierra el canal y la conexión de RabbitMQ si siguen abiertos.
+
+        Si este middleware comparte canal con otro (no es dueño de la
+        conexión), no la cierra: eso le corresponde a quien la creó.
+        """
         if self._channel.is_open:
             _rabbitmq_call(self._channel.close, error=MessageMiddlewareCloseError)
-        if self._connection.is_open:
+        if self._connection is not None and self._connection.is_open:
             _rabbitmq_call(self._connection.close, error=MessageMiddlewareCloseError)
 
 
 class MessageMiddlewareQueueRabbitMQ(
     _MessageMiddlewareRabbitMQ, MessageMiddlewareQueue
 ):
-    def __init__(self, host, queue_name):
+    def __init__(self, host, queue_name, channel=None):
         """Crea la conexión y declara la cola en RabbitMQ."""
         self.queue_name = queue_name
-        super().__init__(host)
+        super().__init__(host, channel=channel)
 
     def _setup_topology(self):
         _rabbitmq_call(self._channel.queue_declare, queue=self.queue_name, durable=True)
@@ -124,15 +150,20 @@ class MessageMiddlewareQueueRabbitMQ(
         """Inicia el consumo de mensajes de la cola asociada a esta instancia."""
         self._consume_from(self.queue_name, on_message_callback)
 
+    def register_consumer(self, on_message_callback):
+        """Registra el consumo de esta cola sin bloquear."""
+        self._register_consumer(self.queue_name, on_message_callback)
+
 
 class MessageMiddlewareExchangeRabbitMQ(
     _MessageMiddlewareRabbitMQ, MessageMiddlewareExchange
 ):
-    def __init__(self, host, exchange_name, routing_keys):
+    def __init__(self, host, exchange_name, routing_keys, channel=None):
         """Crea la conexión y declara el exchange en RabbitMQ"""
         self.exchange_name = exchange_name
         self.routing_keys = routing_keys
-        super().__init__(host)
+        self._consumer_queue_name = None
+        super().__init__(host, channel=channel)
 
     def _setup_topology(self):
         _rabbitmq_call(
@@ -155,11 +186,12 @@ class MessageMiddlewareExchangeRabbitMQ(
                 ),
             )
 
-    def start_consuming(self, on_message_callback):
-        """Inicia el consumo de mensajes del exchange. Se crea una cola anónima
-        y exclusiva para este consumidor, y se vincula a las routing keys configuradas.
-        """
-        # Cola anónima y exclusiva para el suscriptor.
+    def _ensure_consumer_queue(self):
+        """Declara (si hace falta) la cola anónima y exclusiva para este
+        consumidor, vinculada a las routing keys configuradas."""
+        if self._consumer_queue_name is not None:
+            return self._consumer_queue_name
+
         result = _rabbitmq_call(self._channel.queue_declare, queue="", exclusive=True)
         queue_name = result.method.queue
 
@@ -171,4 +203,17 @@ class MessageMiddlewareExchangeRabbitMQ(
                 routing_key=routing_key,
             )
 
+        self._consumer_queue_name = queue_name
+        return queue_name
+
+    def start_consuming(self, on_message_callback):
+        """Inicia el consumo de mensajes del exchange. Se crea una cola anónima
+        y exclusiva para este consumidor, y se vincula a las routing keys configuradas.
+        """
+        queue_name = self._ensure_consumer_queue()
         self._consume_from(queue_name, on_message_callback)
+
+    def register_consumer(self, on_message_callback):
+        """Registra el consumo de este exchange sin bloquear (ver `pump_forever`)."""
+        queue_name = self._ensure_consumer_queue()
+        self._register_consumer(queue_name, on_message_callback)
