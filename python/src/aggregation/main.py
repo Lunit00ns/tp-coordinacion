@@ -36,8 +36,6 @@ class AggregationFilter:
         self.sum_barrier = barrier.ReplicaBarrier(SUM_AMOUNT)
 
     def _process_data(self, client_id, fruit, amount):
-        # Actualiza la fruta acumulando el monto y reordenando con bisect para
-        # preservar el top.
         fruit_top = self.fruit_top_by_client.setdefault(client_id, [])
         for i in range(len(fruit_top)):
             if fruit_top[i].fruit == fruit:
@@ -81,8 +79,11 @@ class AggregationFilter:
         self.input_exchange.stop_consuming()
 
     def close(self):
-        self.input_exchange.close()
-        self.output_queue.close()
+        for resource in [self.input_exchange, self.output_queue]:
+            try:
+                resource.close()
+            except Exception:
+                logger.exception("Error closing resource")
 
 
 def main():
@@ -94,8 +95,10 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    aggregation_filter.start()
-    aggregation_filter.close()
+    try:
+        aggregation_filter.start()
+    finally:
+        aggregation_filter.close()
     return 0
 
 

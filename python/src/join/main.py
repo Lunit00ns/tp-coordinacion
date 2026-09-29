@@ -73,8 +73,11 @@ class JoinFilter:
         self.input_queue.stop_consuming()
 
     def close(self):
-        self.input_queue.close()
-        self.output_queue.close()
+        for resource in [self.input_queue, self.output_queue]:
+            try:
+                resource.close()
+            except Exception:
+                logger.exception("Error closing resource")
 
 
 def main():
@@ -86,8 +89,10 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    join_filter.start()
-    join_filter.close()
+    try:
+        join_filter.start()
+    finally:
+        join_filter.close()
     return 0
 
 

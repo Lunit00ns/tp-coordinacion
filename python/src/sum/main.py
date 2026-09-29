@@ -164,12 +164,14 @@ class SumFilter:
         self.input_queue.stop_consuming()
 
     def close(self):
-        self.input_queue.close()
-        self.control_input.close()
-        for control_output in self.control_outputs:
-            control_output.close()
-        for aggregation_output in self.aggregation_outputs:
-            aggregation_output.close()
+        resources = [self.input_queue, self.control_input]
+        resources.extend(self.control_outputs)
+        resources.extend(self.aggregation_outputs)
+        for resource in resources:
+            try:
+                resource.close()
+            except Exception:
+                logger.exception("Error closing resource")
 
 
 def main():
@@ -181,8 +183,10 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    sum_filter.start()
-    sum_filter.close()
+    try:
+        sum_filter.start()
+    finally:
+        sum_filter.close()
     return 0
 
 
