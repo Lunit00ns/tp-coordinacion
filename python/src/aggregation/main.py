@@ -19,11 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 class AggregationFilter:
-    """Consolida los datos recibidos de Sum por cliente y envía un top parcial a Join.
-
-    Espera el aviso `AGG_BARRIER` de las `SUM_AMOUNT` instancias para confirmar 
-    el fin del flujo y emitir el parcial.
-    """
+    """Junta los totales de Sum por cliente y manda su top parcial a Join
+    cuando avisaron las `SUM_AMOUNT` instancias."""
 
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(

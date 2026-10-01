@@ -18,12 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class JoinFilter:
-    """Consolida los tops parciales de Aggregation en un top final por cliente.
-
-    Junta las frutas reportadas por cada nodo de Aggregation sin sumar (ya que 
-    están particionadas previamente) y devuelve el resultado al recibir las 
-    barreras de las `AGGREGATION_AMOUNT` instancias.
-    """
+    """Une los tops parciales de Aggregation (sin sumar: las frutas ya están
+    particionadas) y responde cuando avisaron las `AGGREGATION_AMOUNT` instancias."""
 
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(

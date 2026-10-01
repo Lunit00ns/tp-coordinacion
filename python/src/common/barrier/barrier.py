@@ -1,10 +1,6 @@
 class ReplicaBarrier:
     """Sincroniza la llegada de reportes de réplicas distintas para una
-    clave hasta alcanzar N.
-
-    Usada por Aggregation y Join para verificar que se hayan recibido
-    todos los avisos de las réplicas esperadas antes de continuar.
-    """
+    clave hasta alcanzar N."""
 
     def __init__(self, expected_count):
         self._expected_count = expected_count
@@ -18,5 +14,5 @@ class ReplicaBarrier:
         return is_new, len(seen) >= self._expected_count
 
     def clear(self, key):
-        """Libera el estado de `key` (llamar una vez resuelta la barrera)."""
+        """Libera el estado de `key` una vez resuelta la barrera."""
         self._seen_by_key.pop(key, None)

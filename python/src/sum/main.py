@@ -16,24 +16,23 @@ SUM_CONTROL_EXCHANGE = f"{SUM_PREFIX}_control"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+# Progreso: se reporta cada K mensajes y el resto, tras un rato sin datos.
+PROGRESS_REPORT_EVERY = int(os.environ.get("PROGRESS_REPORT_EVERY", "100"))
+PROGRESS_FLUSH_DELAY = float(os.environ.get("PROGRESS_FLUSH_DELAY", "0.2"))
+
 im = message_protocol.internal
 logger = logging.getLogger(__name__)
 
 
 def _aggregation_id(client_id, fruit):
-    """Calcula la instancia de Aggregation asignada a una fruta de forma
-    determinista."""
+    """Aggregation asignado a una fruta (determinista entre procesos)."""
     key = f"{client_id}|{fruit}".encode()
     return zlib.crc32(key) % AGGREGATION_AMOUNT
 
 
 class SumFilter:
-    """Suma pares (fruta, cantidad) por cliente y distribuye los totales
-    a Aggregation.
-
-    Usa un protocolo de barrera y reportes de progreso entre réplicas de
-    Sum para garantizar la recepción completa de los datos antes de flushear.
-    """
+    """Suma (fruta, cantidad) por cliente y manda los totales a Aggregation
+    cuando las réplicas de Sum confirman que procesaron todo."""
 
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -63,6 +62,9 @@ class SumFilter:
         self.total_count = {}
         self.progress_reports = {}
         self.flushed_clients = set()
+        # Clientes con mensajes procesados que todavía no se reportaron
+        self.unreported_clients = set()
+        self.report_timer_pending = False
 
     # -- Datos --------------------------------------------------------
 
@@ -74,7 +76,31 @@ class SumFilter:
 
         self.local_count[client_id] = self.local_count.get(client_id, 0) + 1
         if client_id in self.total_count:
-            self._broadcast(self._own_progress_message(client_id))
+            self._report_progress_if_due(client_id)
+
+    def _report_progress_if_due(self, client_id):
+        """Reporta cada K mensajes; el resto lo reporta el temporizador."""
+        if self.local_count[client_id] % PROGRESS_REPORT_EVERY == 0:
+            self._report_progress(client_id)
+            return
+        self.unreported_clients.add(client_id)
+        if not self.report_timer_pending:
+            self.report_timer_pending = True
+            self.input_queue.call_later(
+                PROGRESS_FLUSH_DELAY, self._flush_unreported_progress
+            )
+
+    def _report_progress(self, client_id):
+        self.unreported_clients.discard(client_id)
+        self._broadcast(self._own_progress_message(client_id))
+
+    def _flush_unreported_progress(self):
+        self.report_timer_pending = False
+        try:
+            for client_id in list(self.unreported_clients):
+                self._report_progress(client_id)
+        except Exception:
+            logger.exception("Error reporting pending progress")
 
     def _own_progress_message(self, client_id):
         count = self.local_count.get(client_id, 0)
@@ -111,7 +137,7 @@ class SumFilter:
             if fields["type"] == im.MsgType.SUM_BARRIER:
                 if client_id not in self.total_count:
                     self.total_count[client_id] = fields["total_count"]
-                self._broadcast(self._own_progress_message(client_id))
+                self._report_progress(client_id)
             else:
                 reports = self.progress_reports.setdefault(client_id, {})
                 reports[fields["sum_id"]] = fields["count"]
@@ -139,6 +165,7 @@ class SumFilter:
         if client_id in self.flushed_clients:
             return
         self.flushed_clients.add(client_id)
+        self.unreported_clients.discard(client_id)
         client_state = self.amount_by_client.pop(client_id, {})
         self.local_count.pop(client_id, None)
         self.total_count.pop(client_id, None)
